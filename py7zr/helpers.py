@@ -26,7 +26,6 @@ import ctypes
 import hashlib
 import os
 import pathlib
-import platform
 import posixpath
 import re
 import sys
@@ -120,32 +119,17 @@ def calculate_key(password: bytes, cycles: int, salt: bytes, digest: str) -> byt
         ba = bytearray(salt + password + bytes(32))
         key: bytes = bytes(ba[:32])
     else:
-        cat_cycle = 6
-        if cycles > cat_cycle:
-            rounds = 1 << cat_cycle
-            stages = 1 << (cycles - cat_cycle)
-        else:
-            rounds = 1 << cycles
-            stages = 1 << 0
+        rounds = 1 << cycles
         m = _get_hash(digest)
         saltpassword = salt + password
-        s = 0  # type: int  # (0..stages) * rounds
-        if platform.python_implementation() == "PyPy":
-            for _ in range(stages):
-                m.update(
-                    memoryview(
-                        b"".join(
-                            [saltpassword + (s + i).to_bytes(8, byteorder="little", signed=False) for i in range(rounds)]
-                        )
-                    )
-                )
-                s += rounds
+        if rounds < 256:
+            m.update(b"".join(saltpassword + i.to_bytes(8, byteorder="little") for i in range(rounds)))
         else:
-            for _ in range(stages):
-                m.update(
-                    b"".join([saltpassword + (s + i).to_bytes(8, byteorder="little", signed=False) for i in range(rounds)])
-                )
-                s += rounds
+            # 256 rounds share the upper 7 counter bytes: join on them as the separator.
+            heads = [saltpassword + bytes([lo]) for lo in range(256)]
+            for hi in range(rounds >> 8):
+                tail = hi.to_bytes(7, byteorder="little")
+                m.update(tail.join(heads) + tail)
         key = m.digest()[:32]
 
     return key
