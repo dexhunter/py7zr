@@ -566,14 +566,55 @@ algorithm_class_map: dict[int, tuple[Any, Any]] = {
 
 
 class LZMA1Compressor(ISevenZipCompressor):
+    # Inputs up to this size are buffered and compressed at flush with a dictionary
+    # just large enough to hold them. Binary-tree match finders produce the same
+    # stream as with the configured (much larger and slower to set up) dictionary.
+    _SMALL_INPUT_LIMIT = 64 * 1024
+    _MIN_DICT_SIZE = 4096
+
     def __init__(self, filters):
-        self._compressor = lzma.LZMACompressor(format=lzma.FORMAT_RAW, filters=filters)
+        self._filters = filters
+        small_filters = self._small_filters(self._MIN_DICT_SIZE)
+        if small_filters is None:
+            self._pending = None
+            self._compressor = lzma.LZMACompressor(format=lzma.FORMAT_RAW, filters=filters)
+        else:
+            # The tiny encoder validates the filters early and is reused for inputs up to 4 KiB.
+            self._pending = bytearray()
+            self._compressor = lzma.LZMACompressor(format=lzma.FORMAT_RAW, filters=small_filters)
+
+    def _small_filters(self, dict_size):
+        """Return the filters with a smaller dict_size, or None when that may change the output."""
+        if not isinstance(self._filters, (list, tuple)) or len(self._filters) != 1:
+            return None
+        f = self._filters[0]
+        if not isinstance(f, dict) or f.keys() != {"id", "preset"} or f["id"] not in (lzma.FILTER_LZMA1, lzma.FILTER_LZMA2):
+            return None
+        preset = f["preset"]
+        # Levels 0-3 use hash-chain match finders unless PRESET_EXTREME is set.
+        if not isinstance(preset, int) or ((preset & 0x1F) < 4 and not preset & lzma.PRESET_EXTREME):
+            return None
+        return [dict(f, dict_size=dict_size)]
 
     def compress(self, data: bytes | bytearray | memoryview) -> bytes:
-        return self._compressor.compress(data)
+        if self._pending is None:
+            return self._compressor.compress(data)
+        self._pending += data
+        if len(self._pending) <= self._SMALL_INPUT_LIMIT:
+            return b""
+        # Too large to buffer: continue with the configured encoder.
+        pending, self._pending = self._pending, None
+        self._compressor = lzma.LZMACompressor(format=lzma.FORMAT_RAW, filters=self._filters)
+        return self._compressor.compress(pending)
 
     def flush(self) -> bytes:
-        return self._compressor.flush()
+        if self._pending is None:
+            return self._compressor.flush()
+        pending, self._pending = self._pending, None
+        if len(pending) > self._MIN_DICT_SIZE:
+            dict_size = 1 << (len(pending) - 1).bit_length()
+            self._compressor = lzma.LZMACompressor(format=lzma.FORMAT_RAW, filters=self._small_filters(dict_size))
+        return self._compressor.compress(pending) + self._compressor.flush()
 
 
 class LZMA1Decompressor(ISevenZipDecompressor):
